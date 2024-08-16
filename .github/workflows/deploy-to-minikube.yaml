@@ -1,0 +1,142 @@
+name: CI/CD Pipeline for Backend Deployment
+
+on:
+  push:
+    branches:
+      - main  # Change this to your main branch name
+
+jobs:
+  deploy-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      # Install Minikube and kubectl
+      - name: Install Minikube and kubectl
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl
+          curl -Lo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+          sudo install minikube /usr/local/bin/
+          minikube version
+          curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
+          sudo install kubectl /usr/local/bin/
+          kubectl version --client
+
+      # Start Minikube with Docker driver
+      - name: Start Minikube
+        run: |
+          minikube start --driver=docker --kubernetes-version=v1.23.0
+          minikube status
+
+      # Set Docker environment to Minikube
+      - name: Set Docker environment to Minikube
+        run: eval $(minikube -p minikube docker-env)
+
+      # Load Database Image
+      - name: Load Database Image
+        run: |
+          docker pull postgres:latest
+          docker tag postgres:latest postgres:latest
+          minikube cache add postgres:latest
+
+      # Start PostgreSQL Deployment and Service
+      - name: Deploy PostgreSQL to Minikube
+        run: |
+          kubectl apply -f k8s/db-deployment.yaml
+          kubectl apply -f k8s/db-service.yaml
+
+      # Wait for PostgreSQL deployment to be ready
+      - name: Wait for PostgreSQL deployment
+        run: |
+          kubectl rollout status deployment/postgres-deployment --timeout=1m
+
+      # Build Backend Docker image
+      - name: Build Backend Docker image
+        run: docker build -t assignment-backend:latest backend
+
+      # Save Backend Docker image to tar
+      - name: Save Backend Docker image to tar
+        run: docker image save -o assignment-backend.tar assignment-backend:latest
+
+      # Load Backend Docker image to Minikube
+      - name: Load Backend Docker image to Minikube
+        run: minikube image load assignment-backend.tar
+
+        # Verify the image in Minikube
+      - name: Verify Backend Docker image in Minikube
+        run: |
+          docker images | grep assignment-backend
+
+      # Deploy Backend to Minikube
+      - name: Deploy Backend to Minikube
+        run: |
+          kubectl apply -f k8s/backend-deployment.yaml
+          kubectl apply -f k8s/backend-service.yaml
+
+      # Wait for Backend deployment to be ready
+      - name: Wait for Backend deployment
+        run: |
+          kubectl rollout status deployment/backend-deployment --timeout=1m
+
+       # Check if the application is ready
+      - name: Wait for Spring Boot application to be ready
+        run: |
+          POD_NAME=$(kubectl get pod -l app=backend -o jsonpath="{.items[0].metadata.name}")
+          kubectl port-forward $POD_NAME 8080:8080 &
+          PORT_FORWARD_PID=$!
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/actuator/health | grep '"status":"UP"'; then
+              echo "Application is ready"
+              kill $PORT_FORWARD_PID
+              break
+            fi
+            echo "Waiting for application to be ready..."
+            sleep 5
+            if [ $i -eq 30 ]; then
+              echo "Application did not become ready in time"
+              kill $PORT_FORWARD_PID
+              exit 1
+            fi
+          done
+
+     # Log into running pod
+      - name: Log into running pod
+        run: |
+          POD_NAME=$(kubectl get pod -l app=backend -o jsonpath="{.items[0].metadata.name}")
+          echo "Logging into pod: $POD_NAME"
+          kubectl logs $POD_NAME
+
+       # Test /departments endpoint
+      - name: Test /departments endpoint
+        run: |
+          POD_NAME=$(kubectl get pod -l app=backend -o jsonpath="{.items[0].metadata.name}")
+          kubectl port-forward $POD_NAME 8080:8080 &
+          sleep 5
+          curl -X POST -H "Content-Type: text/plain" -d "Abs" http://localhost:8080/departments
+          kill %1
+          
+      - name: Test /stories endpoint
+        run: |
+          POD_NAME=$(kubectl get pod -l app=backend -o jsonpath="{.items[0].metadata.name}")
+          kubectl port-forward $POD_NAME 8080:8080 &
+          sleep 5
+          curl -X POST -H "Content-Type: application/json" -d '{
+                  "headline": "Cool story",
+                  "content": "Really cool story",
+                  "departmentId": 1
+                }' http://127.0.0.1:8080/stories
+          kill %1
+
+      # Clean up Docker images (optional)
+      - name: Clean up Docker images
+        run: docker system prune -af
+
+      # Stop Minikube
+      - name: Stop Minikube
+        run: minikube stop
+
+      # D
